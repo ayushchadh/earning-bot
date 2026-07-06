@@ -83,6 +83,7 @@ FEATURE_COLS = ['gap_lag1','gap_lag2','rolling_avg','rolling_std','trail_vol_20d
     'avg_vs_vol','n_past']
 
 # ------------------------------------------------------------------ logging
+os.makedirs(DATA_DIR, exist_ok=True)
 log = logging.getLogger("esb"); log.setLevel(logging.INFO)
 for h in (RotatingFileHandler(LOG_F, maxBytes=5_000_000, backupCount=3),
           logging.StreamHandler()):

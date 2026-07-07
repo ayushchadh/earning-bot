@@ -80,8 +80,12 @@ MAX_LEG_SPREAD, GBM_RATIO_MAX, MIN_HISTORY_N = 0.05, 0.85, 4
 # Structure & risk
 WING_MULT          = 3.0    # wings at strike +/- 3x implied move (defined risk)
 STOP_LOSS_FRAC     = 0.50   # close if loss >= 50% of credit received
-RISK_PER_EVENT     = 0.02   # 2% of equity max loss per event
-MAX_TOTAL_RISK     = 0.10   # 10% of equity across concurrent events
+FIXED_QTY          = 1      # ONE lot per name — breadth over size; the earnings
+                            # premium is a small-edge/high-variance signal that
+                            # realizes across MANY independent events, so we trade
+                            # one lot on as many names as possible rather than
+                            # sizing up on few. (Paper forward test.)
+MAX_CONCURRENT     = 40     # cap on simultaneous open names (paper margin guard)
 CONCESSION_CAP_PCT = 0.10   # skip if entry concession > 10% of credit
 
 FEATURE_COLS = ['gap_lag1','gap_lag2','rolling_avg','rolling_std','trail_vol_20d',
@@ -515,16 +519,19 @@ def try_enter(ev, hist_all, vix, gbm, trades):
             rec.update(decision="SKIP",
                        reason=f"concession {concession:.2f} > {CONCESSION_CAP_PCT:.0%} of credit")
             trades.append(rec); return
-        # sizing: defined-risk max loss = wider wing dist − credit
+        # ONE lot per name (breadth over size — the edge realizes across many
+        # independent events, not by sizing up on few). Cap only the NUMBER of
+        # concurrent open names, as a paper-margin guard — not a dollar-risk cap,
+        # which would starve the breadth that IS the edge.
         wing_w = max(k_lc - k_atm, k_atm - k_lp)
         max_loss_per = (wing_w - credit_mid) * 100
         if max_loss_per <= 0:
             rec.update(decision="SKIP", reason="degenerate structure"); trades.append(rec); return
-        eq = get_equity()
-        budget = min(eq * RISK_PER_EVENT, eq * MAX_TOTAL_RISK - open_total_risk(trades))
-        qty = int(budget // max_loss_per)
-        if qty < 1:
-            rec.update(decision="SKIP", reason="risk budget exhausted"); trades.append(rec); return
+        n_open = sum(1 for t in trades if t.get("status") == "OPEN")
+        if n_open >= MAX_CONCURRENT:
+            rec.update(decision="SKIP", reason=f"max concurrent names ({MAX_CONCURRENT}) reached")
+            trades.append(rec); return
+        qty = FIXED_QTY
         legs = [OptionLegRequest(symbol=sc, side=OrderSide.SELL, ratio_qty=1),
                 OptionLegRequest(symbol=sp, side=OrderSide.SELL, ratio_qty=1),
                 OptionLegRequest(symbol=lc, side=OrderSide.BUY,  ratio_qty=1),
@@ -533,9 +540,16 @@ def try_enter(ev, hist_all, vix, gbm, trades):
         if o is None:
             rec.update(decision="NOFILL", reason="entry did not fill"); trades.append(rec); return
         fill_credit = abs(float(getattr(o, "filled_avg_price", credit_mkt) or credit_mkt))
+        max_loss_final = (wing_w - fill_credit) * 100
         rec.update(decision="FILLED", status="OPEN", qty=qty,
                    fill_credit=round(fill_credit, 3),
-                   max_loss_total=round(max_loss_per * qty, 2),
+                   max_loss_per=round(max_loss_final, 2),
+                   max_loss_total=round(max_loss_final * qty, 2),
+                   # risk/reward + wing drag, for post-hoc credit-adequacy analysis
+                   # (NOT filtered on — we measure unconditionally, then learn):
+                   reward_risk=round(fill_credit * 100 / max(max_loss_final, 1), 4),
+                   wing_cost_frac=round(wing_cost_mid / max(straddle_mid, .01), 4),
+                   credit_frac_of_wing=round(fill_credit / max(wing_w, .01), 4),
                    legs={"sc": sc, "sp": sp, "lc": lc, "lp": lp},
                    leg_entries={
                        sc: {"price": round(qsc[2], 2), "iv": None},
@@ -544,9 +558,8 @@ def try_enter(ev, hist_all, vix, gbm, trades):
                        lp: {"price": round(qlp[2], 2), "iv": None}},
                    opened_ts=str(datetime.now(ET)))
         log.info(f"  ✓ OPENED {eid} ×{qty} credit=${fill_credit:.2f} "
-                 f"(imp={imp:.1%}, wings {k_lp}/{k_lc}, "
-                 f"wing cost ${wing_cost_mid:.2f} = "
-                 f"{wing_cost_mid/straddle_mid:.0%} of straddle)")
+                 f"(imp={imp:.1%}, wings {k_lp}/{k_lc}, R:R={rec['reward_risk']:.2f}, "
+                 f"wing cost {rec['wing_cost_frac']:.0%} of straddle)")
     except Exception as e:
         rec.update(decision="ERROR", reason=str(e))
         log.error(f"  {eid}: {e}\n{traceback.format_exc()}")
@@ -651,6 +664,16 @@ def report():
         log.info(f"  realized: n={len(done)} total=${pnls.sum():.0f} "
                  f"mean=${pnls.mean():.0f} worst=${pnls.min():.0f} "
                  f"win={(pnls > 0).mean():.0%}")
+        # credit-adequacy split: do thin-R:R trades underperform? (analysis only,
+        # NOT a live filter — informs whether a future real-money version should
+        # add a credit floor, derived from data rather than assumed)
+        rr = [(t.get("reward_risk"), t["pnl_final"] * 100 * t.get("qty", 1))
+              for t in done if t.get("reward_risk") is not None]
+        if len(rr) >= 10:
+            med = np.median([r for r, _ in rr])
+            rich = [p for r, p in rr if r >= med]; thin = [p for r, p in rr if r < med]
+            log.info(f"  by credit: rich-R:R(≥{med:.2f}) mean=${np.mean(rich):.0f} "
+                     f"n={len(rich)} | thin-R:R mean=${np.mean(thin):.0f} n={len(thin)}")
     log.info("  Decision gate: ≥150 events per PREREGISTRATION.md — do not judge early.")
 
 def run_morning():

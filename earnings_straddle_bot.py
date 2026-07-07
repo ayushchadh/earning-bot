@@ -34,7 +34,7 @@ import numpy as np
 import pandas as pd
 import pytz
 import schedule
-import yfinance as yf
+import requests
 from sklearn.ensemble import GradientBoostingRegressor
 from dotenv import load_dotenv
 
@@ -42,12 +42,18 @@ from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import LimitOrderRequest, OptionLegRequest
 from alpaca.trading.enums import OrderSide, OrderClass, TimeInForce
 from alpaca.data.historical.option import OptionHistoricalDataClient
-from alpaca.data.requests import OptionLatestQuoteRequest
+from alpaca.data.historical.stock import StockHistoricalDataClient
+from alpaca.data.requests import OptionLatestQuoteRequest, StockBarsRequest
+from alpaca.data.timeframe import TimeFrame
+from alpaca.data.enums import Adjustment
+
+import alpaca_data   # SAME module the butterfly bot uses (Alpaca-native, Railway-safe)
 
 load_dotenv()
 
 # ------------------------------------------------------------------ config
 DATA_DIR  = os.environ.get("DATA_DIR", ".")
+os.makedirs(DATA_DIR, exist_ok=True)   # volume may not exist yet — never crash on logging
 ET        = pytz.timezone("US/Eastern")
 HISTORY_F = os.path.join(DATA_DIR, "ticker_history.json")
 TRADES_F  = os.path.join(DATA_DIR, "straddle_trades.json")
@@ -83,7 +89,6 @@ FEATURE_COLS = ['gap_lag1','gap_lag2','rolling_avg','rolling_std','trail_vol_20d
     'avg_vs_vol','n_past']
 
 # ------------------------------------------------------------------ logging
-os.makedirs(DATA_DIR, exist_ok=True)
 log = logging.getLogger("esb"); log.setLevel(logging.INFO)
 for h in (RotatingFileHandler(LOG_F, maxBytes=5_000_000, backupCount=3),
           logging.StreamHandler()):
@@ -96,6 +101,13 @@ trading = TradingClient(os.environ["ALPACA_API_KEY"],
                         os.environ["ALPACA_SECRET_KEY"], paper=True)
 odata   = OptionHistoricalDataClient(os.environ["ALPACA_API_KEY"],
                                      os.environ["ALPACA_SECRET_KEY"])
+sdata   = StockHistoricalDataClient(os.environ["ALPACA_API_KEY"],
+                                    os.environ["ALPACA_SECRET_KEY"])
+alpaca_data.init(trading, sdata, odata)   # wire the shared data module
+
+FINNHUB_KEY = os.environ.get("FINNHUB_KEY", "")
+if not FINNHUB_KEY:
+    log.warning("FINNHUB_KEY not set — earnings calendar will be empty!")
 
 def get_equity():
     return float(trading.get_account().equity)
@@ -184,62 +196,93 @@ def save_trades(t):
 def load_history(): return _load(HISTORY_F, {})
 def save_history(h): _save(HISTORY_F, h)
 
-# ------------------------------------------------------------------ yf data
-def get_vix():
-    try: return float(yf.Ticker("^VIX").history(period="5d")["Close"].iloc[-1])
-    except Exception: return None
+# ------------------------------------------------------------------ data (Alpaca + Finnhub)
+def get_price_series(tk, days=200):
+    """Daily close series via Alpaca bars → pandas Series indexed by date.
+    Replaces yfinance history. Returns None on failure."""
+    try:
+        end = datetime.now(); start = end - timedelta(days=int(days * 1.6) + 10)
+        bars = sdata.get_stock_bars(StockBarsRequest(
+            symbol_or_symbols=[tk], timeframe=TimeFrame.Day,
+            start=start, end=end, feed="iex", adjustment=Adjustment.ALL))
+        data = bars.data.get(tk, []) if hasattr(bars, "data") else []
+        if not data: return None
+        idx = [pd.Timestamp(b.timestamp).tz_localize(None) for b in data]
+        return pd.DataFrame({
+            "Close": [float(b.close) for b in data],
+            "Open":  [float(b.open) for b in data],
+            "Volume":[float(getattr(b, "volume", 0) or 0) for b in data],
+        }, index=pd.DatetimeIndex(idx))
+    except Exception as e:
+        log.warning(f"price series {tk} failed: {e}"); return None
 
 def get_price_df(tk, period="6mo"):
-    try:
-        df = yf.Ticker(tk).history(period=period, auto_adjust=True)
-        return df if len(df) else None
-    except Exception: return None
+    days = {"10d": 12, "6mo": 140, "5y": 1300}.get(period, 140)
+    return get_price_series(tk, days)
 
-def infer_timing(ts):
+def get_vix():
+    """VIX via Finnhub quote (^VIX). Falls back to a neutral 18 if unavailable
+    so the VIX gate doesn't silently block everything."""
+    if not FINNHUB_KEY: return 18.0
     try:
-        t = ts.tz_convert(ET) if ts.tzinfo else ET.localize(ts)
-        return ("BMO" if t.hour < 10 else "AMC"), "high"
-    except Exception: return "AMC", "low"
+        r = requests.get("https://finnhub.io/api/v1/quote",
+                         params={"symbol": "^VIX", "token": FINNHUB_KEY}, timeout=8)
+        v = float(r.json().get("c", 0))
+        return v if v > 0 else 18.0
+    except Exception:
+        return 18.0
 
 def refresh_calendar(days_ahead=10):
+    """Earnings calendar via Finnhub /calendar/earnings (one call, all names).
+    Finnhub 'hour' field: bmo / amc / dmh(during market)."""
     cache = _load(CAL_F, {})
-    if cache.get("asof") == str(date.today()): return cache.get("events", [])
-    log.info("Refreshing earnings calendar (slow, once/day)...")
-    events, now = [], datetime.now()
-    for i, tk in enumerate(UNIVERSE):
-        try:
-            ed = yf.Ticker(tk).get_earnings_dates(limit=4)
-            if ed is None or len(ed) == 0: continue
-            for ts in ed.index:
-                dt = ts.tz_localize(None) if ts.tzinfo is None \
-                     else ts.tz_convert(ET).tz_localize(None)
-                if now - timedelta(days=1) < dt < now + timedelta(days=days_ahead):
-                    tm, conf = infer_timing(ts)
-                    events.append({"ticker": tk, "earnings_dt": str(dt),
-                                   "timing": tm, "timing_confidence": conf})
-        except Exception: pass
-        if i % 10 == 9: time.sleep(1.0)
+    if cache.get("asof") == str(date.today()):
+        return cache.get("events", [])
+    log.info("Refreshing earnings calendar via Finnhub...")
+    events = []
+    if not FINNHUB_KEY:
+        log.error("No FINNHUB_KEY — cannot fetch earnings calendar"); return events
+    uni = set(UNIVERSE)
+    try:
+        frm = date.today().isoformat()
+        to  = (date.today() + timedelta(days=days_ahead)).isoformat()
+        r = requests.get("https://finnhub.io/api/v1/calendar/earnings",
+                         params={"from": frm, "to": to, "token": FINNHUB_KEY}, timeout=20)
+        for e in r.json().get("earningsCalendar", []):
+            sym = e.get("symbol")
+            if sym not in uni: continue
+            hour = (e.get("hour") or "").lower()
+            timing = "BMO" if hour == "bmo" else "AMC"      # dmh/unknown → treat as AMC
+            conf = "high" if hour in ("bmo", "amc") else "low"
+            # earnings 'date' is the session date; store a datetime at a nominal hour
+            dt = datetime.fromisoformat(e["date"]) + (timedelta(hours=7) if timing == "BMO"
+                                                      else timedelta(hours=16))
+            events.append({"ticker": sym, "earnings_dt": str(dt),
+                           "timing": timing, "timing_confidence": conf})
+    except Exception as ex:
+        log.error(f"Finnhub calendar failed: {ex}")
     _save(CAL_F, {"asof": str(date.today()), "events": events})
-    log.info(f"Calendar: {len(events)} events")
+    log.info(f"Calendar: {len(events)} events (Finnhub)")
     return events
 
 def find_weekly_expiry(tk, edt):
-    try: exps = yf.Ticker(tk).options
-    except Exception: return None
+    """Nearest listed expiry after earnings, DTE 0-7, via Alpaca contracts."""
+    exps = alpaca_data.get_option_expirations(tk) or []
     best = None
     for s in exps:
-        dte = (datetime.strptime(s, "%Y-%m-%d") - edt).days
+        try: dte = (datetime.strptime(s, "%Y-%m-%d") - edt).days
+        except Exception: continue
         if 0 <= dte <= 7 and (best is None or dte < best[0]): best = (dte, s)
     if best: return best[1]
     for s in exps:
-        if (datetime.strptime(s, "%Y-%m-%d") - edt).days > 0: return s
+        try:
+            if (datetime.strptime(s, "%Y-%m-%d") - edt).days > 0: return s
+        except Exception: continue
     return None
 
 def listed_strikes(tk, expiry):
-    try:
-        ch = yf.Ticker(tk).option_chain(expiry)
-        return sorted(set(ch.calls["strike"]) & set(ch.puts["strike"]))
-    except Exception: return []
+    return alpaca_data.get_listed_strikes(tk, expiry) or []
+
 
 # ------------------------------------------------------------------ features/GBM
 def compute_features(hist, pdf, vix):
@@ -265,43 +308,60 @@ def update_hist(h, gap):
     h["std"] = float(np.std(h["all_gaps"], ddof=1)) if len(h["all_gaps"]) > 1 else 0.0
     return h
 
+def _finnhub_hist_earnings(tk, years=5):
+    """Historical earnings dates for one ticker via Finnhub. Free tier depth
+    is limited; returns [] on failure (GBM then degrades to N/A)."""
+    if not FINNHUB_KEY: return []
+    try:
+        frm = (date.today() - timedelta(days=365 * years)).isoformat()
+        to  = date.today().isoformat()
+        r = requests.get("https://finnhub.io/api/v1/calendar/earnings",
+                         params={"symbol": tk, "from": frm, "to": to,
+                                 "token": FINNHUB_KEY}, timeout=15)
+        out = []
+        for e in r.json().get("earningsCalendar", []):
+            hour = (e.get("hour") or "").lower()
+            timing = "BMO" if hour == "bmo" else "AMC"
+            dt = datetime.fromisoformat(e["date"]) + (timedelta(hours=7) if timing == "BMO"
+                                                      else timedelta(hours=16))
+            out.append((dt, timing))
+        return sorted(out)
+    except Exception:
+        return []
+
 def train_gbm():
-    log.info("Training GBM from YF-reconstructed history (one-off)...")
-    try: vixdf = yf.Ticker("^VIX").history(period="5y")["Close"]
-    except Exception: vixdf = None
+    """Reconstruct training data from Alpaca daily bars + Finnhub historical
+    earnings dates. If insufficient (free-tier depth), return None → GBM gate
+    is N/A and the bot trades on the primary gates; the model can be trained
+    later as live gaps accumulate. NO yfinance."""
+    log.info("Training GBM (Alpaca bars + Finnhub earnings history)...")
     rows = []
     for i, tk in enumerate(UNIVERSE):
         try:
-            t = yf.Ticker(tk)
-            prices = t.history(period="5y", auto_adjust=True)
-            ed = t.get_earnings_dates(limit=28)
-            if prices is None or len(prices) < 100 or ed is None or not len(ed): continue
-            dates = sorted([(ts.tz_localize(None) if ts.tzinfo is None
-                             else ts.tz_convert(ET).tz_localize(None)) for ts in ed.index])
+            prices = get_price_series(tk, days=1300)   # ~5y via Alpaca
+            dates = _finnhub_hist_earnings(tk)
+            if prices is None or len(prices) < 100 or not dates: continue
             hist = {"gaps": [], "all_gaps": [], "n": 0, "avg": 0.0, "std": 0.0}
-            idx = prices.index.tz_localize(None)
-            for edt in dates:
+            idx = prices.index
+            for edt, timing in dates:
                 if edt > datetime.now(): break
-                timing = "BMO" if edt.hour < 10 else "AMC"
                 before = idx[idx < (edt if timing == "BMO" else edt + timedelta(hours=8))]
                 after  = idx[idx > (edt - timedelta(hours=8) if timing == "BMO" else edt)]
                 if not len(before) or not len(after): continue
-                c0 = prices.iloc[idx.get_loc(before[-1])]["Close"]
-                o1 = prices.iloc[idx.get_loc(after[0])]["Open"]
+                c0 = float(prices.loc[before[-1]]["Close"])
+                o1 = float(prices.loc[after[0]]["Open"])
                 if not (c0 > 0 and o1 > 0): continue
                 gap = abs(o1 / c0 - 1)
                 pdf = prices[idx < before[-1] + pd.Timedelta(days=1)].tail(130)
-                vix = 20.0
-                if vixdf is not None:
-                    vs = vixdf[vixdf.index.tz_localize(None) <= before[-1]]
-                    if len(vs): vix = float(vs.iloc[-1])
-                f = compute_features(hist, pdf, vix) if hist["n"] >= MIN_HISTORY_N else None
+                f = compute_features(hist, pdf, 20.0) if hist["n"] >= MIN_HISTORY_N else None
                 if f is not None: rows.append(f + [gap])
                 update_hist(hist, gap)
         except Exception: pass
-        if i % 10 == 9: time.sleep(1.0)
+        if i % 15 == 14: time.sleep(1.0)
     if len(rows) < 300:
-        log.warning(f"GBM data too small ({len(rows)}) — GBM gate N/A"); return None
+        log.warning(f"GBM data too small ({len(rows)}) — GBM gate N/A; "
+                    f"bot runs on primary gates, GBM can train later on live gaps")
+        return None
     arr = np.array(rows)
     gbm = GradientBoostingRegressor(n_estimators=300, max_depth=4, learning_rate=0.03,
                                     subsample=0.8, loss="squared_error", random_state=42)
@@ -401,7 +461,10 @@ def try_enter(ev, hist_all, vix, gbm, trades):
         strikes = listed_strikes(tk, expiry) if expiry else []
         if not strikes:
             rec.update(decision="SKIP", reason="no expiry/strikes"); trades.append(rec); return
-        spot = float(yf.Ticker(tk).history(period="1d")["Close"].iloc[-1])
+        spot = alpaca_data.get_spot(tk)
+        if spot is None:
+            rec.update(decision="SKIP", reason="no spot"); trades.append(rec); return
+        spot = float(spot)
         k_atm = min(strikes, key=lambda s: abs(s - spot))
         sc, sp = occ(tk, expiry, "C", k_atm), occ(tk, expiry, "P", k_atm)
         qsc, qsp = quote(sc), quote(sp)
@@ -520,14 +583,15 @@ def mark_and_manage():
             if reported:
                 df = get_price_df(t["ticker"], period="10d")
                 if df is not None and len(df) >= 2:
-                    idx = df.index.tz_localize(None)
-                    pre  = idx[idx.date <= edt.date()] if t["timing"] == "AMC" \
-                           else idx[idx.date < edt.date()]
-                    post = idx[idx.date >  edt.date()] if t["timing"] == "AMC" \
-                           else idx[idx.date >= edt.date()]
+                    idx = df.index   # already tz-naive DatetimeIndex from Alpaca
+                    dts = np.array([ts.date() for ts in idx])
+                    pre  = idx[dts <= edt.date()] if t["timing"] == "AMC" \
+                           else idx[dts < edt.date()]
+                    post = idx[dts >  edt.date()] if t["timing"] == "AMC" \
+                           else idx[dts >= edt.date()]
                     if len(pre) and len(post):
-                        c0 = float(df.iloc[idx.get_loc(pre[-1])]["Close"])
-                        o1 = float(df.iloc[idx.get_loc(post[0])]["Open"])
+                        c0 = float(df.loc[pre[-1]]["Close"])
+                        o1 = float(df.loc[post[0]]["Open"])
                         t["gap_abs"] = round(abs(o1 / c0 - 1), 5)
                         hist_all[t["ticker"]] = update_hist(
                             hist_all.get(t["ticker"],

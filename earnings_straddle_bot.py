@@ -571,12 +571,38 @@ def run_t1():
         trades = load_trades(); cal = refresh_calendar()
         hist_all = load_history(); vix = get_vix(); gbm = load_gbm()
         now = datetime.now(ET).replace(tzinfo=None)
+        # Robust window: enter any event reporting from NOW up to ~1 trading day
+        # out that we haven't already recorded. Keying off event_id (in try_enter)
+        # makes this idempotent, so a wider window + catch-up-on-boot can never
+        # double-enter, and a missed 15:30 (redeploy/tz/clock) is recovered on the
+        # next run instead of losing the event forever.
+        already = {t["event_id"] for t in trades}
+        n_in_window = 0
         for ev in cal:
-            edt = datetime.fromisoformat(ev["earnings_dt"])
-            if (ev["timing"] == "AMC" and edt.date() == now.date()) or \
-               (ev["timing"] == "BMO" and edt.date() == (now + timedelta(days=1)).date()):
+            try:
+                edt = datetime.fromisoformat(ev["earnings_dt"])
+            except Exception:
+                log.warning(f"  bad earnings_dt for {ev.get('ticker')}: {ev.get('earnings_dt')}")
+                continue
+            eid = f"{ev['ticker']}_{edt.date()}"
+            if eid in already:
+                continue
+            # In-window if the print is still AHEAD of us (not yet reported) and
+            # within the next ~40 hours — i.e. we can still enter the day/session
+            # before it prints. AMC prints ~after close; BMO prints next open.
+            hours_until = (edt - now).total_seconds() / 3600.0
+            # enter from ~26h before (covers "tomorrow") down to ~0h (today, pre-print)
+            in_window = 0 <= hours_until <= 30 or \
+                        (ev["timing"] == "AMC" and edt.date() == now.date()) or \
+                        (ev["timing"] == "BMO" and edt.date() == (now + timedelta(days=1)).date())
+            if in_window:
+                n_in_window += 1
                 try_enter(ev, hist_all, vix, gbm, trades)
                 time.sleep(0.5)
+        n_entered = sum(1 for t in trades if t.get("status") == "OPEN"
+                        and t["event_id"] not in already)
+        log.info(f"  window scan: {len(cal)} events, {n_in_window} in-window, "
+                 f"{n_entered} newly entered")
         save_trades(trades)
     except Exception as e:
         log.error(f"T-1 run failed: {e}\n{traceback.format_exc()}")
@@ -692,12 +718,25 @@ if __name__ == "__main__":
         run_t1(); run_morning(); sys.exit(0)
     log.info("Earnings straddle bot (defined-risk, Alpaca PAPER) starting")
     log.info(f"Account equity: ${get_equity():,.0f}")
-    schedule.every().day.at("15:30").do(run_t1)
+    log.info(f"Container time: {datetime.now()} | ET now: {datetime.now(ET)}")
+
+    # ENTRY: run hourly through the afternoon rather than a single 15:30 instant,
+    # so a missed run (redeploy / clock / tz) can't lose a day — the wider,
+    # idempotent window in run_t1 means re-running is safe and simply catches up.
+    for hh in ("13:00","14:00","15:00","15:30","16:00","17:00"):
+        schedule.every().day.at(hh).do(run_t1)
+    # MANAGEMENT / marks
     schedule.every().day.at("09:40").do(run_morning)
     for hh in ("10:00","10:30","11:00","11:30","12:00","12:30","13:00",
                "13:30","14:00","14:30","15:00"):
         schedule.every().day.at(hh).do(run_monitor)
     schedule.every().day.at("15:45").do(close_expiring)
+
+    # CATCH-UP ON BOOT: immediately run management and an entry scan, so a deploy
+    # at any time of day recovers today's marks AND any in-window entries missed
+    # while the container was restarting.
     run_morning()
+    run_t1()
+
     while True:
         schedule.run_pending(); time.sleep(30)

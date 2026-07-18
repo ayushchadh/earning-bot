@@ -39,7 +39,8 @@ from sklearn.ensemble import GradientBoostingRegressor
 from dotenv import load_dotenv
 
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import LimitOrderRequest, OptionLegRequest
+from alpaca.trading.requests import (LimitOrderRequest, OptionLegRequest,
+                                     MarketOrderRequest)
 from alpaca.trading.enums import OrderSide, OrderClass, TimeInForce
 from alpaca.data.historical.option import OptionHistoricalDataClient
 from alpaca.data.historical.stock import StockHistoricalDataClient
@@ -145,6 +146,70 @@ def live_option_underlyings():
     except Exception as e:
         log.error(f"position fetch failed: {e}")
     return out
+
+
+def live_stock_positions():
+    """Equity (non-option) positions held on Alpaca -> {symbol: signed_qty}.
+    Short options assigned at expiry turn into stock; the bot must see these."""
+    out = {}
+    try:
+        for p in trading.get_all_positions():
+            s = p.symbol
+            is_option = len(s) > 10 and s[-9] in "CP"
+            if is_option:
+                continue
+            q = float(p.qty)
+            if str(getattr(p, "side", "")).lower().endswith("short"):
+                q = -abs(q)
+            out[s] = q
+    except Exception as e:
+        log.error(f"stock position fetch failed: {e}")
+    return out
+
+
+def liquidate_assignments():
+    """
+    Detect and flatten stock positions created by option ASSIGNMENT.
+
+    A short straddle leg finishing ITM at expiry is assigned -> we end up long
+    (short put assigned) or short (short call assigned) 100 shares per contract.
+    That is pure unmanaged directional risk the strategy never intended to hold,
+    and it ties up buying power. We only ever want option structures, so any
+    equity position in a ticker this bot has traded is flattened at market.
+
+    Safety: only liquidates tickers that appear in our own trade log, so it can
+    never touch unrelated positions in the account (e.g. a manual holding).
+    """
+    try:
+        stocks = live_stock_positions()
+        if not stocks:
+            return
+        trades = load_trades()
+        ours = {t["ticker"] for t in trades if t.get("ticker")}
+        for sym, qty in stocks.items():
+            if sym not in ours:
+                log.info(f"  stock {sym} ×{qty:g} not from this bot — leaving alone")
+                continue
+            if abs(qty) < 1:
+                continue
+            side = OrderSide.SELL if qty > 0 else OrderSide.BUY
+            log.warning(f"  ASSIGNMENT detected: {sym} ×{qty:g} shares — "
+                        f"liquidating at market ({'sell' if qty > 0 else 'buy to cover'})")
+            try:
+                trading.submit_order(MarketOrderRequest(
+                    symbol=sym, qty=abs(qty), side=side,
+                    time_in_force=TimeInForce.DAY))
+                # record it against the originating event(s) for the audit trail
+                for t in trades:
+                    if t.get("ticker") == sym and t.get("status") == "OPEN":
+                        t["assigned"] = True
+                        t["assignment_liquidated_ts"] = str(datetime.now(ET))
+                save_trades(trades)
+                log.info(f"  ✓ liquidation order submitted for {sym}")
+            except Exception as e:
+                log.error(f"  liquidation failed for {sym}: {e}")
+    except Exception as e:
+        log.error(f"liquidate_assignments error: {e}")
 
 # ------------------------------------------------------------------ storage
 def _load(p, d):
@@ -459,7 +524,7 @@ def try_enter(ev, hist_all, vix, gbm, trades):
     if any(t["event_id"] == eid and (t.get("decision") in ("FILLED", "NOFILL", "ERROR")
                                      or t.get("status") == "OPEN") for t in trades):
         return
-    if tk in live_option_underlyings():
+    if tk in live_option_underlyings() or tk in live_stock_positions():
         log.info(f"  {tk}: already holds options — skip"); return
     rec = {"event_id": eid, "ticker": tk, "earnings_dt": ev["earnings_dt"],
            "timing": ev["timing"], "status": "EVALUATED", "vix": vix,
@@ -655,12 +720,13 @@ def mark_and_manage():
                         changed = True
                         log.info(f"  {t['event_id']}: gap={t['gap_abs']:.2%} "
                                  f"vs implied {t.get('implied_move', 0):.2%}")
-        # stop check: mark position, close if loss >= 50% credit
+        # stop check + POST-CRUSH close.
         qs = {k: quote(v) for k, v in t.get("legs", {}).items()}
         if t.get("legs") and all(qs.values()):
             buyback = (qs["sc"][2] + qs["sp"][2]) - (qs["lc"][2] + qs["lp"][2])
             pnl = t["fill_credit"] - buyback
             t["last_mark_pnl"] = round(pnl, 3)
+            # 1) hard stop
             if pnl <= -STOP_LOSS_FRAC * t["fill_credit"]:
                 o = close_mleg(t, "STOP")
                 if o is not None:
@@ -671,6 +737,29 @@ def mark_and_manage():
                              closed_ts=str(datetime.now(ET)))
                     log.info(f"  ✗ STOPPED {t['event_id']} pnl=${t['pnl_final']:.2f}")
                 changed = True
+                continue
+            # 2) POST-CRUSH close: the edge is the vol crush, which is realized
+            #    the session AFTER the print. Holding to expiry only adds multi-day
+            #    directional (short-gamma) risk for pennies of residual decay —
+            #    exactly what turned a +$288 MS winner into a −$117 loser. So once
+            #    the event has REPORTED (gap recorded) and we're past the print,
+            #    close and book the crush. Guarded so we don't close pre-print.
+            reported_and_past = t.get("gap_abs") is not None and (
+                (t["timing"] == "AMC" and now.date() > edt.date()) or
+                (t["timing"] == "BMO" and now.date() >= edt.date()))
+            if reported_and_past:
+                o = close_mleg(t, "POST_CRUSH")
+                if o is not None:
+                    fp = abs(float(getattr(o, "filled_avg_price", buyback) or buyback))
+                    t.update(status="CLOSED", close_reason="POST_CRUSH",
+                             close_debit=round(fp, 3),
+                             pnl_final=round(t["fill_credit"] - fp, 3),
+                             closed_ts=str(datetime.now(ET)))
+                    log.info(f"  ✓ POST-CRUSH CLOSE {t['event_id']} "
+                             f"pnl=${t['pnl_final']:.2f} "
+                             f"(implied {t.get('implied_move',0):.2%} vs "
+                             f"gap {t.get('gap_abs',0):.2%})")
+                    changed = True
     if changed: save_trades(trades); save_history(hist_all)
 
 def close_expiring():
@@ -720,11 +809,17 @@ def report():
 
 def run_morning():
     log.info("=== POST-PRINT / MANAGE RUN ===")
-    try: mark_and_manage(); report()
+    try:
+        # flatten any stock created by assignment FIRST (typically appears the
+        # session after a Friday expiry), then mark/manage the option book
+        liquidate_assignments()
+        mark_and_manage(); report()
     except Exception as e: log.error(f"morning failed: {e}\n{traceback.format_exc()}")
 
 def run_monitor():
-    try: mark_and_manage()
+    try:
+        liquidate_assignments()
+        mark_and_manage()
     except Exception as e: log.error(f"monitor failed: {e}")
 
 # ------------------------------------------------------------------ main

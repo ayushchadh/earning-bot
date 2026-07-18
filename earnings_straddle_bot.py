@@ -744,9 +744,12 @@ def mark_and_manage():
             #    exactly what turned a +$288 MS winner into a −$117 loser. So once
             #    the event has REPORTED (gap recorded) and we're past the print,
             #    close and book the crush. Guarded so we don't close pre-print.
-            reported_and_past = t.get("gap_abs") is not None and (
-                (t["timing"] == "AMC" and now.date() > edt.date()) or
-                (t["timing"] == "BMO" and now.date() >= edt.date()))
+            # T+1 EXIT: close one session AFTER the print, for BOTH timings.
+            #   AMC  prints after the close on day T  -> gap/crush at T+1 open  -> exit T+1
+            #   BMO  prints at the open on day T      -> exit the NEXT session (T+1)
+            # (BMO previously used >= which closed on the print day itself.)
+            reported_and_past = t.get("gap_abs") is not None and \
+                now.date() > edt.date()
             if reported_and_past:
                 o = close_mleg(t, "POST_CRUSH")
                 if o is not None:

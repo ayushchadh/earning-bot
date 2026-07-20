@@ -76,8 +76,23 @@ UNIVERSE = ("AAPL ABBV ABNB ABT ADBE AEP AMAT AMD AMGN AMT AMZN APD AVGO AXP "
     "WFC WMT XOM YUM ZM ZTS").split()
 
 # Gates (per the strategy under test)
-VIX_MAX, MIN_PREMIUM_PCT, MIN_OI = 30.0, 0.04, 500
-MAX_LEG_SPREAD, GBM_RATIO_MAX, MIN_HISTORY_N = 0.05, 0.85, 4
+# Gates. AMENDED 2026-07-20 (see PREREGISTRATION.md §8) — the original
+# 4% premium / 5% spread gates produced ZERO entries across 27 evaluations in
+# the busiest earnings weeks, so the test could not complete. Rationale:
+#   MIN_PREMIUM_PCT 0.04 -> 0.025 : premium richness is an EDGE HYPOTHESIS to be
+#     tested in analysis, not assumed at collection time. Filtering upfront
+#     measures the premium only on a self-selected rich subset (biases C1) and
+#     starves the sample. 2.5% still excludes degenerate no-premium events.
+#   MAX_LEG_SPREAD  0.05 -> 0.10  : spread is a real EXECUTION constraint, so it
+#     stays — but 5% was rejecting GS/C/WFC, among the most liquid options that
+#     exist, which is implausible as a genuine untradeability signal. 10% keeps
+#     the truly untradeable out while capturing the marginal cases so the real
+#     cost cliff becomes visible in the data.
+# A stricter filter can always be RECONSTRUCTED from logged data; skipped events
+# are gone forever. Every event logs implied_move and both leg spreads so the
+# final analysis can report results at 4%/5%, 3.4%, 2.5%/10%, etc.
+VIX_MAX, MIN_PREMIUM_PCT, MIN_OI = 30.0, 0.025, 500
+MAX_LEG_SPREAD, GBM_RATIO_MAX, MIN_HISTORY_N = 0.10, 0.85, 4
 # Structure & risk
 WING_MULT          = 3.0    # wings at strike +/- 3x implied move (defined risk)
 STOP_LOSS_FRAC     = 0.50   # close if loss >= 50% of credit received
@@ -179,8 +194,23 @@ def liquidate_assignments():
 
     Safety: only liquidates tickers that appear in our own trade log, so it can
     never touch unrelated positions in the account (e.g. a manual holding).
+
+    Two hard-won details:
+      - MARKET HOURS ONLY. A market order submitted pre/post-market sits queued
+        and RESERVES the shares (held_for_orders), so every later attempt fails
+        with "insufficient qty available". Check the clock first.
+      - CANCEL STALE ORDERS FIRST. If a previous attempt left an open order on
+        the symbol, the shares are locked. Cancel it, then resubmit.
     """
     try:
+        try:
+            clock = trading.get_clock()
+            if not clock.is_open:
+                return          # silent: normal outside RTH
+        except Exception as e:
+            log.warning(f"clock check failed ({e}) — skipping liquidation this run")
+            return
+
         stocks = live_stock_positions()
         if not stocks:
             return
@@ -192,6 +222,18 @@ def liquidate_assignments():
                 continue
             if abs(qty) < 1:
                 continue
+            # clear anything already holding these shares
+            try:
+                for o in trading.get_orders():
+                    if getattr(o, "symbol", None) == sym and \
+                       str(o.status.value).lower() in ("new", "accepted", "pending_new",
+                                                       "partially_filled", "held"):
+                        trading.cancel_order_by_id(o.id)
+                        log.info(f"  cancelled stale order on {sym} ({o.id})")
+                        time.sleep(1)
+            except Exception as e:
+                log.warning(f"  could not clear orders on {sym}: {e}")
+
             side = OrderSide.SELL if qty > 0 else OrderSide.BUY
             log.warning(f"  ASSIGNMENT detected: {sym} ×{qty:g} shares — "
                         f"liquidating at market ({'sell' if qty > 0 else 'buy to cover'})")
@@ -199,7 +241,6 @@ def liquidate_assignments():
                 trading.submit_order(MarketOrderRequest(
                     symbol=sym, qty=abs(qty), side=side,
                     time_in_force=TimeInForce.DAY))
-                # record it against the originating event(s) for the audit trail
                 for t in trades:
                     if t.get("ticker") == sym and t.get("status") == "OPEN":
                         t["assigned"] = True
@@ -545,16 +586,30 @@ def try_enter(ev, hist_all, vix, gbm, trades):
             rec.update(decision="SKIP", reason="no ATM quotes"); trades.append(rec); return
         straddle_mid = qsc[2] + qsp[2]; straddle_bid = qsc[0] + qsp[0]
         imp = straddle_mid / spot
+        # Record the FULL observable set on EVERY event, before any gate can
+        # reject it. This is what makes post-hoc threshold analysis possible:
+        # results can be recomputed at any premium/spread cutoff later, and the
+        # skipped events still contribute to the distribution.
+        cs = (qsc[1] - qsc[0]) / max(qsc[2], .01)
+        ps = (qsp[1] - qsp[0]) / max(qsp[2], .01)
         rec.update(spot=spot, strike=k_atm, expiry=expiry,
                    straddle_mid=round(straddle_mid, 3),
                    straddle_bid=round(straddle_bid, 3),
-                   implied_move=round(imp, 5))
+                   implied_move=round(imp, 5),
+                   call_spread_pct=round(cs, 4),
+                   put_spread_pct=round(ps, 4),
+                   max_leg_spread_pct=round(max(cs, ps), 4),
+                   gates_version="2026-07-20_amended")
         # gates
         if imp < MIN_PREMIUM_PCT:
-            rec.update(decision="SKIP", reason=f"premium {imp:.1%}<4%"); trades.append(rec); return
-        for q, nm in ((qsc, "call"), (qsp, "put")):
-            if (q[1] - q[0]) / max(q[2], .01) > MAX_LEG_SPREAD:
-                rec.update(decision="SKIP", reason=f"{nm} spread wide"); trades.append(rec); return
+            rec.update(decision="SKIP",
+                       reason=f"premium {imp:.1%}<{MIN_PREMIUM_PCT:.1%}")
+            trades.append(rec); return
+        for val, nm in ((cs, "call"), (ps, "put")):
+            if val > MAX_LEG_SPREAD:
+                rec.update(decision="SKIP",
+                           reason=f"{nm} spread {val:.1%}>{MAX_LEG_SPREAD:.0%}")
+                trades.append(rec); return
         if vix is None or vix > VIX_MAX:
             rec.update(decision="SKIP", reason=f"VIX {vix}"); trades.append(rec); return
         feats = compute_features(hist_all.get(tk), get_price_df(tk), vix)
@@ -809,6 +864,25 @@ def report():
             log.info(f"  by credit: rich-R:R(≥{med:.2f}) mean=${np.mean(rich):.0f} "
                      f"n={len(rich)} | thin-R:R mean=${np.mean(thin):.0f} n={len(thin)}")
     log.info("  Decision gate: ≥150 events per PREREGISTRATION.md — do not judge early.")
+    # Where do the gates actually sit relative to the observed universe? This is
+    # the data that decides whether a threshold is calibrated or arbitrary — and
+    # it exists for SKIPPED events too, which is the whole point of logging
+    # unconditionally.
+    obs = [t for t in trades if t.get("implied_move") is not None]
+    if len(obs) >= 5:
+        imps = sorted(t["implied_move"] for t in obs)
+        sprs = sorted(t["max_leg_spread_pct"] for t in obs
+                      if t.get("max_leg_spread_pct") is not None)
+        def pct(xs, p):
+            return xs[min(int(len(xs) * p), len(xs) - 1)] if xs else float("nan")
+        log.info(f"  observed universe (n={len(obs)}): "
+                 f"implied_move p25={pct(imps,.25):.2%} med={pct(imps,.50):.2%} "
+                 f"p75={pct(imps,.75):.2%} | would pass @4%: "
+                 f"{sum(1 for i in imps if i >= .04)}/{len(imps)}")
+        if sprs:
+            log.info(f"  max leg spread (n={len(sprs)}): p25={pct(sprs,.25):.1%} "
+                     f"med={pct(sprs,.50):.1%} p75={pct(sprs,.75):.1%} | "
+                     f"would pass @5%: {sum(1 for s in sprs if s <= .05)}/{len(sprs)}")
 
 def run_morning():
     log.info("=== POST-PRINT / MANAGE RUN ===")

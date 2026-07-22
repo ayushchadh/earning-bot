@@ -284,6 +284,11 @@ def push_to_dashboard(trades):
                 "qty": t.get("qty", 0),
                 "entry_credit": t.get("fill_credit"),
                 "entry_date": t.get("opened_ts", ""),
+                # attribution inputs — the dashboard needs all three or it can
+                # only report mark-to-market, not a Greek decomposition
+                "entry_spot": t.get("spot"),
+                "initial_dte": t.get("entry_dte"),
+                "entry_iv": t.get("entry_iv"),
                 "strategy": "EARNINGS",
                 "legs": {"short_put": L["sp"], "short_call": L["sc"],
                          "long_put": L["lp"], "long_call": L["lc"]},
@@ -665,8 +670,18 @@ def try_enter(ev, hist_all, vix, gbm, trades):
             rec.update(decision="NOFILL", reason="entry did not fill"); trades.append(rec); return
         fill_credit = abs(float(getattr(o, "filled_avg_price", credit_mkt) or credit_mkt))
         max_loss_final = (wing_w - fill_credit) * 100
+        try:
+            _edte = (datetime.strptime(expiry, "%Y-%m-%d").date()
+                     - datetime.now(ET).date()).days
+        except Exception:
+            _edte = None
+        try:
+            _eiv = alpaca_data.get_atm_iv(tk)
+        except Exception:
+            _eiv = None
         rec.update(decision="FILLED", status="OPEN", qty=qty,
                    fill_credit=round(fill_credit, 3),
+                   entry_dte=_edte, entry_iv=_eiv,
                    max_loss_per=round(max_loss_final, 2),
                    max_loss_total=round(max_loss_final * qty, 2),
                    # risk/reward + wing drag, for post-hoc credit-adequacy analysis
@@ -800,11 +815,16 @@ def mark_and_manage():
             #    the event has REPORTED (gap recorded) and we're past the print,
             #    close and book the crush. Guarded so we don't close pre-print.
             # T+1 EXIT: close one session AFTER the print, for BOTH timings.
-            #   AMC  prints after the close on day T  -> gap/crush at T+1 open  -> exit T+1
-            #   BMO  prints at the open on day T      -> exit the NEXT session (T+1)
-            # (BMO previously used >= which closed on the print day itself.)
-            reported_and_past = t.get("gap_abs") is not None and \
-                now.date() > edt.date()
+            #   AMC  prints after the close on day T -> gap/crush at T+1 open
+            #   BMO  prints at the open on day T     -> exit the NEXT session
+            # DELIBERATELY NOT conditioned on gap_abs. Coupling the exit to the
+            # gap measurement meant a failed price fetch silently disarmed the
+            # exit and the position drifted for days — the exact risk the T+1
+            # rule exists to remove. Time is the trigger; the gap is telemetry.
+            reported_and_past = now.date() > edt.date()
+            if reported_and_past and t.get("gap_abs") is None:
+                log.warning(f"  {t['event_id']}: exiting T+1 with gap NOT recorded "
+                            f"(price fetch failed) — closing anyway")
             if reported_and_past:
                 o = close_mleg(t, "POST_CRUSH")
                 if o is not None:

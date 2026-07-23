@@ -294,6 +294,14 @@ def push_to_dashboard(trades):
                          "long_put": L["lp"], "long_call": L["lc"]},
                 "leg_entries": t.get("leg_entries", {}),
                 "status": t.get("status", "OPEN"),
+                # realized P&L for closed trades — the dashboard cannot see
+                # closed positions via the positions API, so this is its only
+                # source of realized numbers
+                "pnl_final": t.get("pnl_final"),
+                "close_reason": t.get("close_reason"),
+                "closed_ts": t.get("closed_ts"),
+                "gap_abs": t.get("gap_abs"),
+                "implied_move": t.get("implied_move"),
             })
         r = requests.post(url.rstrip("/") + "/api/ingest_trades",
                           json={"trades": payload}, timeout=5)
@@ -523,13 +531,29 @@ def submit_mleg(legs, qty, target_credit, floor_credit, wait=8):
 
 def close_mleg(trade, reason, wait=12):
     """Close all 4 legs atomically: walk debit from mid UP through the
-    marketable ceiling (+1c) — the hardened close from the butterfly bot."""
+    marketable ceiling (+1c) — the hardened close from the butterfly bot.
+
+    Tolerates DEAD WINGS. Far-OTM long wings routinely go no-bid, and quote()
+    then returns None. Refusing to close on a missing quote meant the trades
+    that had moved furthest — precisely the ones needing to be closed — could
+    not be exited at all. A no-bid far-OTM option is worth ~0, so price it at
+    zero and proceed. The SHORT legs must still quote; without them there is no
+    sane limit price."""
     L = trade["legs"]
     qs = {k: quote(v) for k, v in L.items()}
-    if any(v is None for v in qs.values()):
-        log.error("  close: missing quotes"); return None
-    debit_mid = (qs["sc"][2] + qs["sp"][2]) - (qs["lc"][2] + qs["lp"][2])
-    debit_mkt = round((qs["sc"][1] + qs["sp"][1]) - (qs["lc"][0] + qs["lp"][0]), 2)
+    if qs.get("sc") is None or qs.get("sp") is None:
+        log.error("  close: SHORT leg not quoting — cannot price close, retry next run")
+        return None
+    dead = [k for k in ("lc", "lp") if qs.get(k) is None]
+    if dead:
+        log.warning(f"  close: wing(s) {dead} no-bid — treating as worthless")
+
+    def _bid(k): return qs[k][0] if qs.get(k) else 0.0
+    def _ask(k): return qs[k][1] if qs.get(k) else 0.0
+    def _mid(k): return qs[k][2] if qs.get(k) else 0.0
+
+    debit_mid = (_mid("sc") + _mid("sp")) - (_mid("lc") + _mid("lp"))
+    debit_mkt = round((_ask("sc") + _ask("sp")) - (_bid("lc") + _bid("lp")), 2)
     log.info(f"  CLOSING {trade['ticker']} reason={reason} "
              f"mid=${debit_mid:.2f} marketable=${debit_mkt:.2f}")
     legs = [OptionLegRequest(symbol=L["sc"], side=OrderSide.BUY,  ratio_qty=1),
@@ -788,56 +812,71 @@ def mark_and_manage():
                                 {"gaps": [], "all_gaps": [], "n": 0, "avg": 0, "std": 0}),
                             t["gap_abs"])
                         changed = True
+                        _im = t.get("implied_move")
                         log.info(f"  {t['event_id']}: gap={t['gap_abs']:.2%} "
-                                 f"vs implied {t.get('implied_move', 0):.2%}")
-        # stop check + POST-CRUSH close.
+                                 + (f"vs implied {_im:.2%}" if _im is not None
+                                    else "vs implied n/a"))
+        # ---- exit decisions -------------------------------------------------
+        # CRITICAL: the exit must NOT depend on every leg having a live quote.
+        # The far wings sit 3x the implied move out and routinely go NO-BID once
+        # the underlying moves, so quote() returns None for them. Requiring
+        # all four quotes meant the positions MOST in need of exiting (big move
+        # -> dead wing) were the ones silently skipped, and nothing ever closed.
+        # Treat a missing/dead quote as zero value, which is what a no-bid
+        # far-OTM option is worth, and always evaluate the time-based exit.
         qs = {k: quote(v) for k, v in t.get("legs", {}).items()}
-        if t.get("legs") and all(qs.values()):
-            buyback = (qs["sc"][2] + qs["sp"][2]) - (qs["lc"][2] + qs["lp"][2])
+
+        def _mid(key):
+            q = qs.get(key)
+            return q[2] if q else 0.0
+
+        have_shorts = qs.get("sc") is not None and qs.get("sp") is not None
+        buyback = (_mid("sc") + _mid("sp")) - (_mid("lc") + _mid("lp"))
+        if have_shorts:
             pnl = t["fill_credit"] - buyback
             t["last_mark_pnl"] = round(pnl, 3)
-            # 1) hard stop
-            if pnl <= -STOP_LOSS_FRAC * t["fill_credit"]:
-                o = close_mleg(t, "STOP")
-                if o is not None:
-                    fp = abs(float(getattr(o, "filled_avg_price", buyback) or buyback))
-                    t.update(status="CLOSED", close_reason="STOP",
-                             close_debit=round(fp, 3),
-                             pnl_final=round(t["fill_credit"] - fp, 3),
-                             closed_ts=str(datetime.now(ET)))
-                    log.info(f"  ✗ STOPPED {t['event_id']} pnl=${t['pnl_final']:.2f}")
+        else:
+            pnl = None
+            log.warning(f"  {t['event_id']}: short legs not quoting — "
+                        f"mark unavailable, time-based exit still applies")
+
+        # 1) hard stop (needs a usable mark, so only when shorts are quoting)
+        if pnl is not None and pnl <= -STOP_LOSS_FRAC * t["fill_credit"]:
+            o = close_mleg(t, "STOP")
+            if o is not None:
+                fp = abs(float(getattr(o, "filled_avg_price", buyback) or buyback))
+                t.update(status="CLOSED", close_reason="STOP",
+                         close_debit=round(fp, 3),
+                         pnl_final=round(t["fill_credit"] - fp, 3),
+                         closed_ts=str(datetime.now(ET)))
+                log.info(f"  ✗ STOPPED {t['event_id']} pnl=${t['pnl_final']:.2f}")
+            changed = True
+            continue
+
+        # 2) T+1 EXIT — close one session AFTER the print, for BOTH timings.
+        #    Time is the trigger. Neither the gap measurement nor the quote
+        #    availability may disarm it; both are telemetry, not preconditions.
+        reported_and_past = now.date() > edt.date()
+        if reported_and_past:
+            if t.get("gap_abs") is None:
+                log.warning(f"  {t['event_id']}: exiting T+1 with gap NOT recorded")
+            o = close_mleg(t, "POST_CRUSH")
+            if o is not None:
+                fp = abs(float(getattr(o, "filled_avg_price", buyback) or buyback))
+                t.update(status="CLOSED", close_reason="POST_CRUSH",
+                         close_debit=round(fp, 3),
+                         pnl_final=round(t["fill_credit"] - fp, 3),
+                         closed_ts=str(datetime.now(ET)))
+                _imp = t.get("implied_move")
+                _gap = t.get("gap_abs")
+                log.info(f"  ✓ POST-CRUSH CLOSE {t['event_id']} "
+                         f"pnl=${t['pnl_final']:.2f} "
+                         f"(implied {_imp:.2%} vs gap {_gap:.2%})"
+                         if _imp is not None and _gap is not None else
+                         f"  ✓ POST-CRUSH CLOSE {t['event_id']} "
+                         f"pnl=${t['pnl_final']:.2f} "
+                         f"(implied={_imp} gap={_gap})")
                 changed = True
-                continue
-            # 2) POST-CRUSH close: the edge is the vol crush, which is realized
-            #    the session AFTER the print. Holding to expiry only adds multi-day
-            #    directional (short-gamma) risk for pennies of residual decay —
-            #    exactly what turned a +$288 MS winner into a −$117 loser. So once
-            #    the event has REPORTED (gap recorded) and we're past the print,
-            #    close and book the crush. Guarded so we don't close pre-print.
-            # T+1 EXIT: close one session AFTER the print, for BOTH timings.
-            #   AMC  prints after the close on day T -> gap/crush at T+1 open
-            #   BMO  prints at the open on day T     -> exit the NEXT session
-            # DELIBERATELY NOT conditioned on gap_abs. Coupling the exit to the
-            # gap measurement meant a failed price fetch silently disarmed the
-            # exit and the position drifted for days — the exact risk the T+1
-            # rule exists to remove. Time is the trigger; the gap is telemetry.
-            reported_and_past = now.date() > edt.date()
-            if reported_and_past and t.get("gap_abs") is None:
-                log.warning(f"  {t['event_id']}: exiting T+1 with gap NOT recorded "
-                            f"(price fetch failed) — closing anyway")
-            if reported_and_past:
-                o = close_mleg(t, "POST_CRUSH")
-                if o is not None:
-                    fp = abs(float(getattr(o, "filled_avg_price", buyback) or buyback))
-                    t.update(status="CLOSED", close_reason="POST_CRUSH",
-                             close_debit=round(fp, 3),
-                             pnl_final=round(t["fill_credit"] - fp, 3),
-                             closed_ts=str(datetime.now(ET)))
-                    log.info(f"  ✓ POST-CRUSH CLOSE {t['event_id']} "
-                             f"pnl=${t['pnl_final']:.2f} "
-                             f"(implied {t.get('implied_move',0):.2%} vs "
-                             f"gap {t.get('gap_abs',0):.2%})")
-                    changed = True
     if changed: save_trades(trades); save_history(hist_all)
 
 def close_expiring():
